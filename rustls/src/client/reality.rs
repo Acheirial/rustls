@@ -43,6 +43,12 @@ use crate::SupportedCipherSuite;
 #[cfg(feature = "std")]
 use std::sync::Mutex;
 
+/// ML-DSA-65 public key size in bytes (FIPS 204).
+pub const MLDSA65_PUBLIC_KEY_SIZE: usize = 1952;
+
+/// ML-DSA-65 signature size in bytes (FIPS 204).
+pub const MLDSA65_SIGNATURE_SIZE: usize = 3309;
+
 /// VLESS Reality protocol configuration
 ///
 /// This configuration specifies the parameters needed for the Reality protocol,
@@ -73,10 +79,18 @@ pub struct RealityConfig {
     short_id: Vec<u8>,
     /// Protocol version (3 bytes, default [0, 0, 0])
     client_version: [u8; 3],
+    /// Optional ML-DSA-65 public key (FIPS 204) for post-quantum verification
+    /// of the server certificate's extra signature (Xray `mldsa65Verify`).
+    pub(crate) mldsa65_verify: Option<Vec<u8>>,
     /// Shared slot for the derived auth_key, populated during handshake
     /// and consumed by RealityServerCertVerifier
     #[cfg(feature = "std")]
     pub(crate) auth_key_slot: Arc<Mutex<Option<[u8; 32]>>>,
+    /// Shared slot for the concatenated `ClientHello || ServerHello` bytes,
+    /// populated during the handshake and consumed by the ML-DSA-65
+    /// verification path in `RealityServerCertVerifier`.
+    #[cfg(feature = "std")]
+    pub(crate) transcript_slot: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl RealityConfig {
@@ -108,8 +122,11 @@ impl RealityConfig {
             server_public_key,
             short_id,
             client_version: [0, 0, 0],
+            mldsa65_verify: None,
             #[cfg(feature = "std")]
             auth_key_slot: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "std")]
+            transcript_slot: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -121,6 +138,21 @@ impl RealityConfig {
         self.client_version = version;
         self
     }
+
+    /// Set the ML-DSA-65 public key used to verify the server certificate's
+    /// extra post-quantum signature (Xray `mldsa65Verify`).
+    ///
+    /// When set, a matching REALITY server embeds an ML-DSA-65 signature over
+    /// `HMAC-SHA512(auth_key, ed25519_pubkey || ClientHello || ServerHello)`
+    /// in its certificate's first X.509 extension, which this client verifies.
+    pub fn with_mldsa65_verify(mut self, public_key: Vec<u8>) -> Result<Self, RealityConfigError> {
+        // ML-DSA-65 public keys are 1952 bytes per FIPS 204.
+        if public_key.len() != MLDSA65_PUBLIC_KEY_SIZE {
+            return Err(RealityConfigError::InvalidMldsa65KeyLength);
+        }
+        self.mldsa65_verify = Some(public_key);
+        Ok(self)
+    }
 }
 
 /// Errors that can occur when creating a Reality configuration
@@ -128,6 +160,8 @@ impl RealityConfig {
 pub enum RealityConfigError {
     /// The short_id exceeds the maximum length of 8 bytes
     ShortIdTooLong,
+    /// The ML-DSA-65 public key is not the expected 1952-byte length
+    InvalidMldsa65KeyLength,
     /// A cryptographic operation failed
     CryptoError(alloc::string::String),
 }
@@ -137,6 +171,9 @@ impl core::fmt::Display for RealityConfigError {
         match self {
             Self::ShortIdTooLong => {
                 write!(f, "Reality short_id must be at most 8 bytes")
+            }
+            Self::InvalidMldsa65KeyLength => {
+                write!(f, "Reality mldsa65_verify must be 1952 bytes")
             }
             Self::CryptoError(msg) => {
                 write!(f, "Reality crypto error: {}", msg)
@@ -228,7 +265,7 @@ fn x25519_ecdh(private_key: &[u8; 32], peer_public_key: &[u8; 32]) -> Result<[u8
 /// the Reality session_id.
 #[derive(Clone)]
 pub(crate) struct RealitySessionState {
-    config: Arc<RealityConfig>,
+    pub(crate) config: Arc<RealityConfig>,
     /// Client's ephemeral X25519 private key (32 bytes)
     client_private: [u8; 32],
     /// Client's ephemeral X25519 public key (32 bytes)
@@ -236,6 +273,10 @@ pub(crate) struct RealitySessionState {
     /// ECDH shared secret with server's static public key (32 bytes)
     /// Used for Reality authentication (session_id encryption)
     auth_shared_secret: [u8; 32],
+    /// The full encoded ClientHello message bytes, captured during
+    /// `compute_session_id`. Used later as input to the ML-DSA-65
+    /// signature verification (when `mldsa65_verify` is set).
+    client_hello_bytes: Option<Vec<u8>>,
 }
 
 impl RealitySessionState {
@@ -259,6 +300,7 @@ impl RealitySessionState {
             client_private,
             client_public,
             auth_shared_secret,
+            client_hello_bytes: None,
         })
     }
 
@@ -291,7 +333,7 @@ impl RealitySessionState {
     ///
     /// 32 bytes: ciphertext (16 bytes) + authentication tag (16 bytes)
     pub(crate) fn compute_session_id(
-        &self,
+        &mut self,
         random: &Random,
         hello_bytes: &[u8],
         hkdf: &dyn Hkdf,
@@ -339,7 +381,14 @@ impl RealitySessionState {
             *slot = Some(auth_key);
         }
 
+        self.client_hello_bytes = Some(hello_bytes.to_vec());
+
         Ok(result)
+    }
+
+    /// The full encoded ClientHello message, if `compute_session_id` has run.
+    pub(crate) fn client_hello_bytes(&self) -> Option<&[u8]> {
+        self.client_hello_bytes.as_deref()
     }
 }
 
@@ -568,6 +617,37 @@ fn hmac_sha512(key: &[u8; 32], data: &[u8]) -> [u8; 64] {
     out
 }
 
+/// Streaming HMAC-SHA512: `HMAC-SHA512(key, data1 || data2)`.
+///
+/// Xray's server builds the ML-DSA-65 signed digest by writing the
+/// Ed25519 public key, then the ClientHello, then the ServerHello into a
+/// running HMAC state.
+#[cfg(all(feature = "mldsa65", feature = "ring"))]
+fn hmac_sha512_stream(key: &[u8; 32], data1: &[u8], data2: &[u8]) -> [u8; 64] {
+    use ring::hmac;
+    let k = hmac::Key::new(hmac::HMAC_SHA512, key);
+    let mut ctx = hmac::Context::with_key(&k);
+    ctx.update(data1);
+    ctx.update(data2);
+    let tag = ctx.sign();
+    let mut out = [0u8; 64];
+    out.copy_from_slice(tag.as_ref());
+    out
+}
+
+#[cfg(all(feature = "mldsa65", not(feature = "ring"), feature = "aws_lc_rs"))]
+fn hmac_sha512_stream(key: &[u8; 32], data1: &[u8], data2: &[u8]) -> [u8; 64] {
+    use aws_lc_rs::hmac;
+    let k = hmac::Key::new(hmac::HMAC_SHA512, key);
+    let mut ctx = hmac::Context::with_key(&k);
+    ctx.update(data1);
+    ctx.update(data2);
+    let tag = ctx.sign();
+    let mut out = [0u8; 64];
+    out.copy_from_slice(tag.as_ref());
+    out
+}
+
 /// Verify an Ed25519 signature using ring
 #[cfg(feature = "ring")]
 fn ed25519_verify(pubkey: &[u8; 32], message: &[u8], signature: &[u8]) -> bool {
@@ -593,6 +673,8 @@ fn ed25519_verify(pubkey: &[u8; 32], message: &[u8], signature: &[u8]) -> bool {
 fn verify_reality_cert(
     cert: &pki_types::CertificateDer<'_>,
     auth_key: &[u8; 32],
+    transcript: Option<&[u8]>,
+    mldsa65_verify: Option<&[u8]>,
 ) -> Option<Result<crate::verify::ServerCertVerified, Error>> {
     let cert_bytes = cert.as_ref();
     if cert_bytes.len() < 64 {
@@ -601,21 +683,105 @@ fn verify_reality_cert(
 
     let pubkey = extract_ed25519_pubkey_from_reality_cert(cert_bytes)?;
 
+    // The REALITY server overwrites the cert's signature field with
+    // HMAC-SHA512(auth_key, ed25519_public_key).
     let expected = hmac_sha512(auth_key, &pubkey);
     let cert_tail = &cert_bytes[cert_bytes.len() - 64..];
 
-    if constant_time_eq(&expected, cert_tail) {
-        Some(Ok(crate::verify::ServerCertVerified::assertion()))
-    } else {
+    if !constant_time_eq(&expected, cert_tail) {
         // HMAC mismatch — not a Reality cert for this session
-        None
+        return None;
     }
+
+    // HMAC matched: this is a REALITY cert. If the client configured an
+    // ML-DSA-65 public key, the server additionally signs
+    // HMAC-SHA512(auth_key, ed25519_pubkey || ClientHello || ServerHello)
+    // and stores the 3309-byte signature in the cert's first X.509
+    // extension (at a fixed offset in Xray's implementation).
+    if let (Some(mldsa65_pubkey), Some(transcript)) = (mldsa65_verify, transcript) {
+        return Some(verify_reality_cert_mldsa65(
+            cert_bytes,
+            auth_key,
+            &pubkey,
+            transcript,
+            mldsa65_pubkey,
+        ));
+    }
+
+    Some(Ok(crate::verify::ServerCertVerified::assertion()))
+}
+
+/// Verify the ML-DSA-65 extra signature embedded in a REALITY certificate.
+///
+/// Xray's server (when `mldsa65Seed` is set) carries a 3309-byte extension
+/// value and writes the ML-DSA-65 signature at a fixed offset in the
+/// certificate DER. The signed message is the running HMAC-SHA512 state
+/// over `auth_key`: `HMAC(ed25519_pubkey) || ClientHello || ServerHello`.
+#[cfg(all(feature = "mldsa65", any(feature = "ring", feature = "aws_lc_rs")))]
+fn verify_reality_cert_mldsa65(
+    cert_bytes: &[u8],
+    auth_key: &[u8; 32],
+    ed25519_pubkey: &[u8; 32],
+    transcript: &[u8],
+    mldsa65_pubkey: &[u8],
+) -> Result<crate::verify::ServerCertVerified, Error> {
+    use ml_dsa::{MlDsa65, VerifyingKey};
+
+    // Xray signs: h := HMAC-SHA512(authKey, ed25519Pub);
+    //              h.Write(clientHello); h.Write(serverHello);
+    //              signature over h.Sum(nil).
+    let signed_message = hmac_sha512_stream(auth_key, ed25519_pubkey, transcript);
+
+    let signature = find_mldsa65_signature(cert_bytes)
+        .ok_or_else(|| Error::General("REALITY cert has no ML-DSA-65 signature".into()))?;
+
+    let mut enc_key = [0u8; MLDSA65_PUBLIC_KEY_SIZE];
+    enc_key.copy_from_slice(mldsa65_pubkey);
+    let vk = VerifyingKey::<MlDsa65>::decode((&enc_key).into());
+
+    // Xray uses the raw FIPS 204 Verify (empty context).
+    if vk.verify_with_context(&signed_message, b"", &signature) {
+        Ok(crate::verify::ServerCertVerified::assertion())
+    } else {
+        Err(Error::InvalidCertificate(
+            crate::error::CertificateError::BadSignature,
+        ))
+    }
+}
+
+/// Locate the 3309-byte ML-DSA-65 signature in a REALITY certificate.
+///
+/// Xray embeds it as the value of the first X.509 extension (`{0,0}` OID,
+/// 3309 bytes). We scan for an ASN.1 OCTET STRING wrapper of exactly that
+/// length and return the inner bytes.
+#[cfg(all(feature = "mldsa65", any(feature = "ring", feature = "aws_lc_rs")))]
+fn find_mldsa65_signature(cert_bytes: &[u8]) -> Option<ml_dsa::Signature<ml_dsa::MlDsa65>> {
+    use ml_dsa::{MlDsa65, Signature};
+
+    // OCTET STRING tag (0x04) + 3309-length encoding (0x82 0x0C 0xED)
+    let needle = [0x04u8, 0x82, 0x0C, 0xED];
+    let mut idx = 0usize;
+    while idx + needle.len() + MLDSA65_SIGNATURE_SIZE <= cert_bytes.len() {
+        if cert_bytes[idx..idx + needle.len()] == needle {
+            let start = idx + needle.len();
+            let end = start + MLDSA65_SIGNATURE_SIZE;
+            let mut enc = [0u8; MLDSA65_SIGNATURE_SIZE];
+            enc.copy_from_slice(&cert_bytes[start..end]);
+            if let Some(sig) = Signature::<MlDsa65>::decode((&enc).into()) {
+                return Some(sig);
+            }
+        }
+        idx += 1;
+    }
+    None
 }
 
 #[cfg(not(any(feature = "ring", feature = "aws_lc_rs")))]
 fn verify_reality_cert(
     _cert: &pki_types::CertificateDer<'_>,
     _auth_key: &[u8; 32],
+    _transcript: Option<&[u8]>,
+    _mldsa65_verify: Option<&[u8]>,
 ) -> Option<Result<crate::verify::ServerCertVerified, Error>> {
     None
 }
@@ -639,6 +805,11 @@ fn verify_reality_cert(
 pub struct RealityServerCertVerifier {
     /// Slot containing the auth_key computed during ClientHello construction
     auth_key_slot: Arc<Mutex<Option<[u8; 32]>>>,
+    /// Slot containing the `ClientHello || ServerHello` bytes, set during
+    /// the handshake. Required for ML-DSA-65 verification.
+    transcript_slot: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Optional ML-DSA-65 public key for post-quantum cert verification
+    mldsa65_verify: Option<Vec<u8>>,
     /// Fallback verifier (used when the cert is not a REALITY cert)
     inner: Arc<dyn crate::verify::ServerCertVerifier>,
 }
@@ -648,9 +819,16 @@ impl RealityServerCertVerifier {
     /// Create a new verifier wrapping `inner`.
     pub fn new(
         auth_key_slot: Arc<Mutex<Option<[u8; 32]>>>,
+        transcript_slot: Arc<Mutex<Option<Vec<u8>>>>,
+        mldsa65_verify: Option<Vec<u8>>,
         inner: Arc<dyn crate::verify::ServerCertVerifier>,
     ) -> Arc<Self> {
-        Arc::new(Self { auth_key_slot, inner })
+        Arc::new(Self {
+            auth_key_slot,
+            transcript_slot,
+            mldsa65_verify,
+            inner,
+        })
     }
 }
 
@@ -672,7 +850,17 @@ impl crate::verify::ServerCertVerifier for RealityServerCertVerifier {
             .and_then(|g| *g);
 
         if let Some(ref key) = auth_key {
-            if let Some(result) = verify_reality_cert(end_entity, key) {
+            let transcript = self
+                .transcript_slot
+                .lock()
+                .ok()
+                .and_then(|g| g.clone());
+            if let Some(result) = verify_reality_cert(
+                end_entity,
+                key,
+                transcript.as_deref(),
+                self.mldsa65_verify.as_deref(),
+            ) {
                 return result;
             }
         }
