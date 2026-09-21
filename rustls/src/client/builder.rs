@@ -164,11 +164,13 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             use crate::client::reality::RealityServerCertVerifier;
             let auth_key_slot = Arc::clone(&config.auth_key_slot);
             let transcript_slot = Arc::clone(&config.transcript_slot);
+            let verified_slot = Arc::clone(&config.verified_slot);
             let mldsa65_verify = config.mldsa65_verify.clone();
             let inner = Arc::clone(&self.state.verifier);
             self.state.verifier = RealityServerCertVerifier::new(
                 auth_key_slot,
                 transcript_slot,
+                verified_slot,
                 mldsa65_verify,
                 inner,
             );
