@@ -218,7 +218,7 @@ fn emit_client_hello_for_retry<T>(
     mut input: ClientHelloInput,
     cx: &mut ClientContext<'_>,
     mut ech_state: Option<EchState>,
-    reality_state: Option<reality::RealitySessionState>,
+    mut reality_state: Option<reality::RealitySessionState>,
 ) -> NextStateOrError<'static>
 where
     T: Fn(&[u8]) -> [u8; 32],
@@ -489,7 +489,7 @@ where
 
     // Compute Reality session_id BEFORE PSK binder to avoid invalidating the binder
     // Reality uses ClientHello with session_id=0 as AAD, so this order is safe
-    if let Some(ref reality) = reality_state {
+    if let Some(ref mut reality) = reality_state {
         // Step 1: Set session_id to zero temporarily
         let mut buffer = Vec::new();
         match &mut chp.0 {
@@ -935,6 +935,24 @@ impl State<ClientConnectionData> for ExpectServerHello {
             .transcript_buffer
             .start_hash(suite.hash_provider());
         transcript.add_message(&m);
+
+        // REALITY: record `ClientHello || ServerHello` for later ML-DSA-65
+        // certificate verification (Xray `mldsa65Verify`).
+        if let Some(reality) = self.reality_state.as_ref() {
+            if let Some(ch_bytes) = reality.client_hello_bytes() {
+                let mut full = Vec::with_capacity(ch_bytes.len() + 256);
+                full.extend_from_slice(ch_bytes);
+                match &m.payload {
+                    MessagePayload::Handshake { encoded, .. } => full.extend(encoded.bytes()),
+                    MessagePayload::HandshakeFlight(p) => full.extend(p.bytes()),
+                    _ => {}
+                };
+                let slot = &reality.config.transcript_slot;
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(full);
+                }
+            }
+        }
 
         let randoms = ConnectionRandoms::new(self.input.random, server_hello.random);
         // For TLS1.3, start message encryption using
