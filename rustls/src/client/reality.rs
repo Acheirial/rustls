@@ -91,6 +91,12 @@ pub struct RealityConfig {
     /// verification path in `RealityServerCertVerifier`.
     #[cfg(feature = "std")]
     pub(crate) transcript_slot: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Set to `true` once a REALITY certificate passes HMAC (and, when
+    /// configured, ML-DSA-65) verification. Callers inspect this after the
+    /// handshake to distinguish REALITY certs from genuine website
+    /// certificates (Xray's `Verified` field, used to trigger spiderX).
+    #[cfg(feature = "std")]
+    pub(crate) verified_slot: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RealityConfig {
@@ -127,6 +133,8 @@ impl RealityConfig {
             auth_key_slot: Arc::new(Mutex::new(None)),
             #[cfg(feature = "std")]
             transcript_slot: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "std")]
+            verified_slot: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -134,6 +142,18 @@ impl RealityConfig {
     ///
     /// The client version is a 3-byte field in the Reality protocol.
     /// Default is `[0, 0, 0]`.
+    /// Whether the server presented a certificate that passed REALITY
+    /// verification during the handshake.
+    ///
+    /// `false` means the server handed us a genuine (or invalid) certificate
+    /// for the SNI — the connection is talking to the real website, not to
+    /// a REALITY server. Callers typically log this and may run a decoy
+    /// crawler (Xray `spiderX`).
+    #[cfg(feature = "std")]
+    pub fn verified(&self) -> bool {
+        self.verified_slot.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn with_client_version(mut self, version: [u8; 3]) -> Self {
         self.client_version = version;
         self
@@ -808,6 +828,8 @@ pub struct RealityServerCertVerifier {
     /// Slot containing the `ClientHello || ServerHello` bytes, set during
     /// the handshake. Required for ML-DSA-65 verification.
     transcript_slot: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Set to true once a REALITY certificate verifies successfully
+    verified_slot: Arc<std::sync::atomic::AtomicBool>,
     /// Optional ML-DSA-65 public key for post-quantum cert verification
     mldsa65_verify: Option<Vec<u8>>,
     /// Fallback verifier (used when the cert is not a REALITY cert)
@@ -820,12 +842,14 @@ impl RealityServerCertVerifier {
     pub fn new(
         auth_key_slot: Arc<Mutex<Option<[u8; 32]>>>,
         transcript_slot: Arc<Mutex<Option<Vec<u8>>>>,
+        verified_slot: Arc<std::sync::atomic::AtomicBool>,
         mldsa65_verify: Option<Vec<u8>>,
         inner: Arc<dyn crate::verify::ServerCertVerifier>,
     ) -> Arc<Self> {
         Arc::new(Self {
             auth_key_slot,
             transcript_slot,
+            verified_slot,
             mldsa65_verify,
             inner,
         })
@@ -861,6 +885,10 @@ impl crate::verify::ServerCertVerifier for RealityServerCertVerifier {
                 transcript.as_deref(),
                 self.mldsa65_verify.as_deref(),
             ) {
+                if result.is_ok() {
+                    self.verified_slot
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 return result;
             }
         }
